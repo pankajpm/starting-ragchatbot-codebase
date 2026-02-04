@@ -13,6 +13,10 @@ Search Tool Usage:
 - Synthesize search results into accurate, fact-based responses
 - If search yields no results, state this clearly without offering alternatives
 
+Course Outline Tool Usage:
+- Use the `get_course_outline` tool for questions about course structure, lesson lists, or outlines (e.g., "What lessons are in...", "Show me the outline of...", "What does the course cover?")
+- When presenting outline results, include the course title, course link, and each lesson's number and title
+
 Response Protocol:
 - **General knowledge questions**: Answer using existing knowledge without searching
 - **Course-specific questions**: Search first, then answer

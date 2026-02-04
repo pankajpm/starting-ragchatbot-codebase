@@ -101,10 +101,12 @@ class CourseSearchTool(Tool):
             header += "]"
             
             # Track source for the UI
-            source = course_title
+            label = course_title
+            url = None
             if lesson_num is not None:
-                source += f" - Lesson {lesson_num}"
-            sources.append(source)
+                label += f" - Lesson {lesson_num}"
+                url = self.store.get_lesson_link(course_title, lesson_num)
+            sources.append({"label": label, "url": url})
             
             formatted.append(f"{header}\n{doc}")
         
@@ -112,6 +114,78 @@ class CourseSearchTool(Tool):
         self.last_sources = sources
         
         return "\n\n".join(formatted)
+
+
+class CourseOutlineTool(Tool):
+    """Tool for retrieving course structure and lesson outlines"""
+
+    def __init__(self, vector_store: VectorStore):
+        self.store = vector_store
+        self.last_sources = []
+
+    def get_tool_definition(self) -> Dict[str, Any]:
+        return {
+            "name": "get_course_outline",
+            "description": "Retrieve the structure and outline of a course, including its title, link, instructor, and full list of lessons. Use this for questions about course structure, lesson lists, or 'what lessons are in' a course.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "course_name": {
+                        "type": "string",
+                        "description": "Course title or partial name (e.g. 'MCP', 'Introduction')"
+                    }
+                },
+                "required": ["course_name"]
+            }
+        }
+
+    def execute(self, course_name: str) -> str:
+        import json
+
+        # Resolve course name via fuzzy matching
+        resolved_title = self.store._resolve_course_name(course_name)
+        if not resolved_title:
+            return f"No course found matching '{course_name}'."
+
+        # Retrieve course metadata
+        try:
+            results = self.store.course_catalog.get(ids=[resolved_title])
+        except Exception as e:
+            return f"Error retrieving course metadata: {e}"
+
+        if not results or not results['metadatas'] or not results['metadatas'][0]:
+            return f"No metadata found for course '{resolved_title}'."
+
+        metadata = results['metadatas'][0]
+        course_title = metadata.get('title', resolved_title)
+        course_link = metadata.get('course_link', '')
+        instructor = metadata.get('instructor', '')
+        lessons_json = metadata.get('lessons_json', '[]')
+
+        lessons = json.loads(lessons_json)
+
+        # Track source for the UI
+        self.last_sources = [{"label": course_title, "url": course_link}]
+
+        # Format the outline
+        lines = [f"Course: {course_title}"]
+        if course_link:
+            lines.append(f"Link: {course_link}")
+        if instructor:
+            lines.append(f"Instructor: {instructor}")
+        lines.append(f"\nLessons ({len(lessons)} total):")
+
+        for lesson in lessons:
+            lesson_num = lesson.get('lesson_number', '?')
+            lesson_title = lesson.get('lesson_title', 'Untitled')
+            lesson_link = lesson.get('lesson_link', '')
+            entry = f"  Lesson {lesson_num}: {lesson_title}"
+            if lesson_link:
+                entry += f" ({lesson_link})"
+            lines.append(entry)
+
+        return "\n".join(lines)
+
 
 class ToolManager:
     """Manages available tools for the AI"""
