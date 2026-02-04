@@ -59,3 +59,10 @@ class SessionManager:
         """Clear all messages from a session"""
         if session_id in self.sessions:
             self.sessions[session_id] = []
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session entirely. Returns True if session existed."""
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            return True
+        return False
