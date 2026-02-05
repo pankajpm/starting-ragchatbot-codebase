@@ -124,7 +124,7 @@ class TestAIGeneratorToolExecution:
         # Verify two API calls were made
         assert mock_client.messages.create.call_count == 2
 
-        # Verify second call includes tool result
+        # Verify second call includes tool result and tools (for possible second round)
         second_call_kwargs = mock_client.messages.create.call_args_list[1]
         kwargs = second_call_kwargs.kwargs if second_call_kwargs.kwargs else second_call_kwargs[1]
         messages = kwargs["messages"]
@@ -133,29 +133,164 @@ class TestAIGeneratorToolExecution:
         assert tool_result_msg["role"] == "user"
         assert tool_result_msg["content"][0]["type"] == "tool_result"
         assert tool_result_msg["content"][0]["tool_use_id"] == "tool_123"
+        # Tools should be included (round 0 < MAX_TOOL_ROUNDS - 1)
+        assert "tools" in kwargs
 
     @patch("ai_generator.anthropic.Anthropic")
-    def test_second_call_omits_tools(self, mock_anthropic_cls):
-        """The follow-up API call after tool execution should NOT include tools"""
+    def test_two_round_tool_use(self, mock_anthropic_cls):
+        """Two sequential tool calls: tool_use -> tool_use -> text response"""
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
 
-        tool_response = _make_tool_use_response("search_course_content", {"query": "test"})
-        final_response = _make_text_response("Final answer")
-        mock_client.messages.create.side_effect = [tool_response, final_response]
+        # Round 1: Claude calls get_course_outline
+        first_tool = _make_tool_use_response(
+            "get_course_outline", {"course_name": "MCP"}, "tool_1"
+        )
+        # Round 2: Claude calls search_course_content
+        second_tool = _make_tool_use_response(
+            "search_course_content", {"query": "lesson 3 topics"}, "tool_2"
+        )
+        # Final: text response
+        final = _make_text_response("Lesson 3 covers X, Y, Z.")
+
+        mock_client.messages.create.side_effect = [first_tool, second_tool, final]
 
         mock_tool_manager = MagicMock()
-        mock_tool_manager.execute_tool.return_value = "search results"
+        mock_tool_manager.execute_tool.side_effect = [
+            "Lesson 1: Intro\nLesson 2: Basics\nLesson 3: Advanced",
+            "Lesson 3 content about X, Y, Z"
+        ]
+
+        tools = [
+            {"name": "get_course_outline", "description": "test", "input_schema": {"type": "object", "properties": {}}},
+            {"name": "search_course_content", "description": "test", "input_schema": {"type": "object", "properties": {}}},
+        ]
+
+        generator = AIGenerator(api_key="test-key", model="claude-sonnet-4-20250514")
+        result = generator.generate_response(
+            query="What topics does lesson 3 cover?",
+            tools=tools,
+            tool_manager=mock_tool_manager
+        )
+
+        assert result == "Lesson 3 covers X, Y, Z."
+        assert mock_tool_manager.execute_tool.call_count == 2
+        assert mock_client.messages.create.call_count == 3
+
+        # Verify message structure: user, assistant(tool1), tool_result1, assistant(tool2), tool_result2
+        final_call_kwargs = mock_client.messages.create.call_args_list[2]
+        kwargs = final_call_kwargs.kwargs if final_call_kwargs.kwargs else final_call_kwargs[1]
+        messages = kwargs["messages"]
+        assert len(messages) == 5
+        assert messages[0]["role"] == "user"
+        assert messages[1]["role"] == "assistant"
+        assert messages[2]["role"] == "user"  # tool_result 1
+        assert messages[3]["role"] == "assistant"
+        assert messages[4]["role"] == "user"  # tool_result 2
+
+    @patch("ai_generator.anthropic.Anthropic")
+    def test_max_rounds_terminates(self, mock_anthropic_cls):
+        """Loop should stop after MAX_TOOL_ROUNDS even if Claude keeps requesting tools"""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+
+        # All responses request tools (more than MAX_TOOL_ROUNDS)
+        tool1 = _make_tool_use_response("search_course_content", {"query": "a"}, "t1")
+        tool2 = _make_tool_use_response("search_course_content", {"query": "b"}, "t2")
+        # Third response also requests tool, but loop should have ended
+        tool3 = _make_tool_use_response("search_course_content", {"query": "c"}, "t3")
+
+        mock_client.messages.create.side_effect = [tool1, tool2, tool3]
+
+        mock_tool_manager = MagicMock()
+        mock_tool_manager.execute_tool.return_value = "results"
 
         tools = [{"name": "search_course_content", "description": "test", "input_schema": {"type": "object", "properties": {}}}]
 
         generator = AIGenerator(api_key="test-key", model="claude-sonnet-4-20250514")
-        generator.generate_response(query="test", tools=tools, tool_manager=mock_tool_manager)
+        result = generator.generate_response(
+            query="test", tools=tools, tool_manager=mock_tool_manager
+        )
 
-        # Second call should not have "tools" key
+        # Should return fallback since the final response has no text block
+        assert result == "I'm sorry, I wasn't able to generate a response. Please try again."
+        # Only 2 tool executions (MAX_TOOL_ROUNDS)
+        assert mock_tool_manager.execute_tool.call_count == 2
+        # 3 API calls: initial + 2 follow-ups
+        assert mock_client.messages.create.call_count == 3
+
+    @patch("ai_generator.anthropic.Anthropic")
+    def test_tool_error_stops_loop(self, mock_anthropic_cls):
+        """If execute_tool raises, error is sent as tool_result, one final call without tools, then loop stops"""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+
+        tool_response = _make_tool_use_response(
+            "search_course_content", {"query": "test"}, "tool_err"
+        )
+        error_reply = _make_text_response("Sorry, I encountered an error searching.")
+
+        mock_client.messages.create.side_effect = [tool_response, error_reply]
+
+        mock_tool_manager = MagicMock()
+        mock_tool_manager.execute_tool.side_effect = Exception("Connection timeout")
+
+        tools = [{"name": "search_course_content", "description": "test", "input_schema": {"type": "object", "properties": {}}}]
+
+        generator = AIGenerator(api_key="test-key", model="claude-sonnet-4-20250514")
+        result = generator.generate_response(
+            query="test", tools=tools, tool_manager=mock_tool_manager
+        )
+
+        # After error, a follow-up call is made without tools so Claude can respond
+        assert result == "Sorry, I encountered an error searching."
+        assert mock_client.messages.create.call_count == 2
+
+        # The follow-up call should not include tools
         second_call_kwargs = mock_client.messages.create.call_args_list[1]
         kwargs = second_call_kwargs.kwargs if second_call_kwargs.kwargs else second_call_kwargs[1]
         assert "tools" not in kwargs
+
+        # The error tool_result should be in the messages
+        messages = kwargs["messages"]
+        tool_result_msg = messages[-1]
+        assert tool_result_msg["role"] == "user"
+        assert tool_result_msg["content"][0]["is_error"] is True
+        assert "Connection timeout" in tool_result_msg["content"][0]["content"]
+
+    @patch("ai_generator.anthropic.Anthropic")
+    def test_final_call_omits_tools(self, mock_anthropic_cls):
+        """After 2 tool rounds, the 3rd API call should NOT include tools"""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+
+        tool1 = _make_tool_use_response("search_course_content", {"query": "a"}, "t1")
+        tool2 = _make_tool_use_response("search_course_content", {"query": "b"}, "t2")
+        final = _make_text_response("Final answer")
+
+        mock_client.messages.create.side_effect = [tool1, tool2, final]
+
+        mock_tool_manager = MagicMock()
+        mock_tool_manager.execute_tool.return_value = "results"
+
+        tools = [{"name": "search_course_content", "description": "test", "input_schema": {"type": "object", "properties": {}}}]
+
+        generator = AIGenerator(api_key="test-key", model="claude-sonnet-4-20250514")
+        result = generator.generate_response(
+            query="test", tools=tools, tool_manager=mock_tool_manager
+        )
+
+        assert result == "Final answer"
+
+        # The third (final) API call should NOT include tools
+        third_call_kwargs = mock_client.messages.create.call_args_list[2]
+        kwargs = third_call_kwargs.kwargs if third_call_kwargs.kwargs else third_call_kwargs[1]
+        assert "tools" not in kwargs
+
+        # The second API call SHOULD include tools (round 0 < MAX_TOOL_ROUNDS - 1)
+        second_call_kwargs = mock_client.messages.create.call_args_list[1]
+        kwargs2 = second_call_kwargs.kwargs if second_call_kwargs.kwargs else second_call_kwargs[1]
+        assert "tools" in kwargs2
 
     @patch("ai_generator.anthropic.Anthropic")
     def test_api_error_propagates(self, mock_anthropic_cls):
